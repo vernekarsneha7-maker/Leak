@@ -1,0 +1,235 @@
+import requests
+from flask import Flask, jsonify
+from flask import request
+import psycopg2
+import pandas as pd
+import joblib
+import threading
+import time
+import random
+import threading
+from sqlalchemy import create_engine
+
+
+
+app = Flask(__name__)
+
+# -----------------------------
+# POSTGRESQL CONNECTION
+# -----------------------------
+
+conn = psycopg2.connect(
+    host="localhost",
+    database="water_leak_detection_db",
+    user="postgres",
+    password="testpass123"
+)
+
+engine = create_engine("postgresql://postgres:testpass123@localhost/water_leak_detection_db")
+query = """
+SELECT *
+FROM sensor_data
+WHERE processed = FALSE
+ORDER BY timestamp ASC
+LIMIT 5;
+"""
+
+
+cursor = conn.cursor()
+
+leak_type = random.choice(["small", "medium", "large"])
+leak_model = joblib.load("models/leak_model.pkl")
+size_model = joblib.load("models/size_model.pkl")
+size_map = {0: "SMALL", 1: "MEDIUM", 2: "LARGE"}
+
+# -----------------------------
+# HOME
+# -----------------------------
+@app.route("/")
+def home():
+    return jsonify({"message": "Backend running"})
+
+# -----------------------------
+# GET LIVE RESULTS (FOR UI)
+# -----------------------------
+@app.route("/results")
+def get_results():
+    # -----------------------------
+    # API KEY CHECK (ADD HERE)
+    # -----------------------------
+    api_key = request.headers.get("API-Key")
+
+    if api_key != "12345":
+        return {"error": "Unauthorized"}, 403
+
+    # -----------------------------
+    # YOUR EXISTING LOGIC (UNCHANGED)
+    # -----------------------------
+    cursor.execute("""
+        SELECT sensor_id, node_id, pump_status, leak_status, leak_size, timestamp
+        FROM results
+        ORDER BY timestamp DESC
+        LIMIT 50
+    """)
+
+    rows = cursor.fetchall()
+
+    data = []
+    for r in rows:
+        data.append({
+            "sensor_id": r[0],
+            "node_id": r[1],
+            "pump_status": r[2],
+            "leak_status": r[3],
+            "leak_size": r[4],
+            "timestamp": str(r[5])
+        })
+
+    return jsonify(data)
+
+def fetch_api_data():
+    if leak_type == "small":
+        pressure_out = pressure_in - random.uniform(0.2, 0.8)
+        flow_out = flow_in - random.uniform(1, 5)
+
+    elif leak_type == "medium":
+      pressure_out = pressure_in - random.uniform(1, 2)
+      flow_out = flow_in - random.uniform(5, 15)
+
+    else:
+     pressure_out = pressure_in - random.uniform(2, 4)
+    flow_out = flow_in - random.uniform(15, 30)
+    try:
+        url = "https://api.open-meteo.com/v1/forecast?latitude=12.97&longitude=77.59&current=pressure_msl,wind_speed_10m"
+        res = requests.get(url, timeout=5)
+        data = res.json()["current"]
+
+        pressure_in = data["pressure_msl"] / 100
+
+        # create variation (important for ML)
+        pressure_out = pressure_in - (0.5 + (data["wind_speed_10m"] % 2))
+
+        flow_in = data["wind_speed_10m"] * 10
+        flow_out = flow_in - (5 + (data["wind_speed_10m"] % 5))
+
+        return {
+            "sensor_id": 1,
+            "node_id": 1,
+            "pressure_in_bar": pressure_in,
+            "pressure_out_bar": pressure_out,
+            "flow_in": flow_in,
+            "flow_out": flow_out,
+            "pump_status": 1
+        }
+
+    except Exception as e:
+        print("API Error:", e)
+        return None
+
+# -----------------------------
+# AUTO DATA GENERATOR (SIMULATION)
+# -----------------------------
+def generate_data():
+    while True:
+        row = fetch_api_data()
+
+        if row:
+            cursor.execute("""
+                INSERT INTO sensor_data
+                (sensor_id, node_id, pump_status, pressure_in_bar, pressure_out_bar, flow_in, flow_out, processed)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE)
+            """, (
+                row["sensor_id"],
+                row["node_id"],
+                row["pump_status"],
+                row["pressure_in_bar"],
+                row["pressure_out_bar"],
+                row["flow_in"],
+                row["flow_out"]
+            ))
+
+            conn.commit()
+
+        time.sleep(5)
+
+# -----------------------------
+# AUTO TRIGGER MODEL
+# -----------------------------
+def run_live_monitoring():
+    while True:
+
+        df = pd.read_sql("""
+            SELECT * FROM sensor_data
+            WHERE processed = FALSE
+            ORDER BY timestamp ASC
+            LIMIT 5
+        """, engine)
+
+        if not df.empty:
+            for _, row in df.iterrows():
+
+                pressure_drop = row["pressure_in_bar"] - row["pressure_out_bar"]
+                flow_loss = abs(row["flow_in"] - row["flow_out"])
+
+                X = pd.DataFrame([{
+                    "pressure_in_bar": row["pressure_in_bar"],
+                    "pressure_out_bar": row["pressure_out_bar"],
+                    "pressure_drop": pressure_drop,
+                    "flow_loss": flow_loss
+                }])
+
+                # -------------------------
+                # FIXED LOGIC
+                # -------------------------
+                if row["pump_status"] == 0:
+                    leak_status = f"Pump OFF at Sensor {row['sensor_id']} Node {row['node_id']}"
+                    leak_size = None
+
+                else:
+                    leak_pred = leak_model.predict(X)[0]
+
+                    if leak_pred == 1:
+                        size_pred = size_model.predict(X)[0]
+                        leak_status = "Leak Detected"
+                        leak_size = size_map.get(size_pred)
+                    else:
+                        leak_status = "Normal"
+                        leak_size = None
+
+                # -------------------------
+                # STORE RESULT
+                # -------------------------
+                cursor.execute("""
+                    INSERT INTO results
+                    (sensor_id, node_id, pump_status, leak_status, leak_size)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (
+                    row["sensor_id"],
+                    row["node_id"],
+                    row["pump_status"],
+                    leak_status,
+                    leak_size
+                ))
+
+                cursor.execute("""
+                    UPDATE sensor_data SET processed = TRUE WHERE id = %s
+                """, (row["id"],))
+
+            conn.commit()
+
+        time.sleep(5)
+
+# -----------------------------
+# START BACKGROUND THREADS
+# -----------------------------
+threading.Thread(target=generate_data, daemon=True).start()
+threading.Thread(target=run_live_monitoring, daemon=True).start()
+
+
+# -----------------------------
+# RUN
+# -----------------------------
+if __name__ == "__main__":
+    app.run(debug=True, use_reloader=False)
+
+conn.rollback()
